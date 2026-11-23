@@ -11,6 +11,12 @@ BasicAuth, and Altare's Go proxy never sends credentials, so every
 visit 401s and trips Kasm's brute-force blacklist. A form login +
 session cookie travels fine through the proxy, and the websocket
 stream Kasm needs is spliced through byte-for-byte after login.
+
+Lockout: 5 failed logins from one key locks that key out for 10
+minutes. The key is the visitor IP from X-Forwarded-For when the
+Altare proxy passes it, else the peer IP (in that case every visitor
+shares one key and a lock affects everyone until it expires or the
+app restarts).
 """
 
 import hashlib
@@ -41,6 +47,48 @@ else:
 
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
+
+MAX_FAILS = 5
+LOCK_SECONDS = 600  # 10 minutes
+FAILS = {}  # key -> {"count": int, "locked_until": float}
+FAILS_LOCK = threading.Lock()
+
+
+def client_key(handler):
+    """Key for rate limiting: real visitor IP if the Altare proxy passes
+    X-Forwarded-For, else the peer IP (all visitors then share one key)."""
+    xff = handler.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0]
+
+
+def is_locked(key):
+    with FAILS_LOCK:
+        entry = FAILS.get(key)
+        return bool(entry and entry["locked_until"] > time.time())
+
+
+def record_fail(key):
+    """Count a failed login; returns True if the key is now locked."""
+    now = time.time()
+    with FAILS_LOCK:
+        entry = FAILS.setdefault(key, {"count": 0, "locked_until": 0})
+        if entry["locked_until"] > now:
+            return True
+        entry["count"] += 1
+        if entry["count"] >= MAX_FAILS:
+            entry["locked_until"] = now + LOCK_SECONDS
+            entry["count"] = 0
+            print("desk-auth-proxy: LOCKED %s for %d seconds after %d failures"
+                  % (key, LOCK_SECONDS, MAX_FAILS), flush=True)
+            return True
+        return False
+
+
+def reset_fails(key):
+    with FAILS_LOCK:
+        FAILS.pop(key, None)
 
 
 def new_session():
@@ -180,7 +228,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not valid_session(self.session_token()):
             if self.command == "GET" and path == "/":
-                err = "密码错误，请重试。" if "err=1" in (urlparse(self.path).query or "") else ""
+                query = urlparse(self.path).query or ""
+                if "err=locked" in query:
+                    err = "尝试次数过多，请 10 分钟后再试。"
+                elif "err=1" in query:
+                    err = "密码错误，请重试。"
+                else:
+                    err = ""
                 self.send_login_page(err)
             else:
                 # API / asset / websocket without a session: send them to login.
@@ -193,18 +247,25 @@ class Handler(BaseHTTPRequestHandler):
             self._proxy_http()
 
     def _do_login(self):
+        key = client_key(self)
+        if is_locked(key):
+            print("desk-auth-proxy: login BLOCKED (locked) for %s" % key, flush=True)
+            self.redirect("/?err=locked")
+            return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length > 0 else b""
         fields = parse_qs(raw.decode("utf-8", "ignore"))
         attempt = (fields.get("password") or [""])[0]
         ok = bool(PASSWORD) and hmac.compare_digest(attempt, PASSWORD)
         if ok:
+            reset_fails(key)
             print("desk-auth-proxy: login OK from %s" % client_ip(self), flush=True)
             self.redirect("/", set_cookie=new_session())
         else:
+            locked = record_fail(key)
             print("desk-auth-proxy: login FAILED from %s" % client_ip(self), flush=True)
             time.sleep(1)  # slow brute force a little
-            self.redirect("/?err=1")
+            self.redirect("/?err=locked" if locked else "/?err=1")
 
     # -- plain HTTP proxy ------------------------------------------------
     def _proxy_http(self):
