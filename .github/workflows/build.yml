@@ -20,4 +20,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/kasm-chrome-nossl:1.17.0
+          tags: ghcr.io/spongext/kasm-chrome-nossl:1.17.0
